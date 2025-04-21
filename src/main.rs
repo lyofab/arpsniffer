@@ -1,8 +1,13 @@
+use axum::{extract::Path, http::StatusCode, response::Json, routing::get, Router};
 use pcap::{Capture, Device};
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    net::Ipv4Addr,
+    sync::{Arc, Mutex},
+    thread,
+};
+use tokio::signal;
 
 #[repr(packed)]
 #[derive(Debug)]
@@ -16,6 +21,12 @@ struct ArpPacket {
     spa: [u8; 4],
     tha: [u8; 6],
     tpa: [u8; 4],
+}
+
+#[derive(Serialize)]
+struct Mapping {
+    mac: String,
+    ip: String,
 }
 
 fn parse_arp_packet(data: &[u8]) -> Option<ArpPacket> {
@@ -35,27 +46,20 @@ fn parse_arp_packet(data: &[u8]) -> Option<ArpPacket> {
     })
 }
 
-fn main() {
-    let devices = Device::list().expect("Failed to list devices");
-    println!("Available Devices:");
-    for device in &devices {
-        println!(
-            "- {} ({})",
-            device.name,
-            device.desc.clone().unwrap_or("No description".to_string())
-        );
-    }
-
-    let interface_name = "wlxd017c2a11456"; // Change this to your interface
-    let device = devices
-        .into_iter()
-        .find(|d| d.name == interface_name)
-        .expect("Device not found");
-
+#[tokio::main]
+async fn main() {
     let ip_mac_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let map_clone = ip_mac_map.clone();
 
-    let map_clone = Arc::clone(&ip_mac_map);
+    // Start packet capture in background
     thread::spawn(move || {
+        let interface_name = "wlxd017c2a11456"; // Change this to match your interface
+        let device = Device::list()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == interface_name)
+            .expect("Device not found");
+
         let mut cap = Capture::from_device(device)
             .unwrap()
             .promisc(true)
@@ -63,7 +67,7 @@ fn main() {
             .open()
             .expect("Failed to open capture");
 
-        cap.filter("arp", true).expect("Failed to set ARP filter");
+        cap.filter("arp", true).expect("Failed to set filter");
 
         while let Ok(packet) = cap.next() {
             if packet.data.len() < 42 {
@@ -84,14 +88,74 @@ fn main() {
 
                 let mut map = map_clone.lock().unwrap();
                 map.insert(mac.clone(), ip.to_string());
-
-                println!("ARP: {} is at {}", ip, mac);
             }
         }
     });
 
-    // Keep running or replace this with a REST API
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(10));
+    // Build API
+    let app = Router::new()
+        .route("/ip/:mac", get(with_mac))
+        .route("/search", get(search_mac))
+        .route("/all", get(all_mappings))
+        .with_state(ip_mac_map);
+
+    println!("🚀 Server running on http://localhost:3000");
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn with_mac(
+    Path(mac): Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<HashMap<String, String>>>>,
+) -> Result<Json<Mapping>, StatusCode> {
+    let db = state.lock().unwrap();
+    if let Some(ip) = db.get(&mac.to_lowercase()) {
+        Ok(Json(Mapping {
+            mac,
+            ip: ip.clone(),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
+}
+
+async fn search_mac(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<HashMap<String, String>>>>,
+) -> Json<Vec<Mapping>> {
+    let needle = params
+        .get("mac")
+        .map(|m| m.to_lowercase())
+        .unwrap_or_default();
+    let db = state.lock().unwrap();
+    let results: Vec<Mapping> = db
+        .iter()
+        .filter(|(mac, _)| mac.contains(&needle))
+        .map(|(mac, ip)| Mapping {
+            mac: mac.clone(),
+            ip: ip.clone(),
+        })
+        .collect();
+
+    Json(results)
+}
+
+async fn all_mappings(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<HashMap<String, String>>>>,
+) -> Json<Vec<Mapping>> {
+    let db = state.lock().unwrap();
+    let results: Vec<Mapping> = db
+        .iter()
+        .map(|(mac, ip)| Mapping {
+            mac: mac.clone(),
+            ip: ip.clone(),
+        })
+        .collect();
+    Json(results)
+}
+
+async fn shutdown_signal() {
+    let _ = signal::ctrl_c().await;
+    println!("Shutdown signal received.");
 }
