@@ -1,13 +1,29 @@
-use axum::{extract::Path, http::StatusCode, response::Json, routing::get, Router};
+use axum::{
+    body::Body,
+    extract::Path,
+    http::{Response, StatusCode},
+    response::Json,
+    response::Redirect,
+    routing::get,
+    Router,
+};
+use clap::Parser;
 use pcap::{Capture, Device};
 use serde::Serialize;
 use std::{
     collections::HashMap,
     net::Ipv4Addr,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
 };
-use tokio::signal;
+use tokio::{fs, signal};
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(short, long)]
+    iface: String,
+}
 
 #[repr(packed)]
 #[derive(Debug)]
@@ -46,14 +62,28 @@ fn parse_arp_packet(data: &[u8]) -> Option<ArpPacket> {
     })
 }
 
+async fn handle_index() -> Result<Response<Body>, (StatusCode, String)> {
+    let path = PathBuf::from("./static/index.html");
+    match fs::read_to_string(path).await {
+        Ok(content) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html")
+            .body(Body::from(content))
+            .unwrap()),
+        Err(_) => Err((StatusCode::NOT_FOUND, "File not found".to_string())),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let ip_mac_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let map_clone = ip_mac_map.clone();
 
+    let args = Cli::parse();
+
     // Start packet capture in background
     thread::spawn(move || {
-        let interface_name = "wlxd017c2a11456"; // Change this to match your interface
+        let interface_name = args.iface; // Change this to match your interface
         let device = Device::list()
             .unwrap()
             .into_iter()
@@ -80,16 +110,29 @@ async fn main() {
             }
 
             if let Some(arp) = parse_arp_packet(&packet.data[14..]) {
-                let mac = format!(
+                let sender_mac = format!(
                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     arp.sha[0], arp.sha[1], arp.sha[2], arp.sha[3], arp.sha[4], arp.sha[5]
                 );
-                let ip = Ipv4Addr::new(arp.spa[0], arp.spa[1], arp.spa[2], arp.spa[3]);
+                let sender_ip = Ipv4Addr::new(arp.spa[0], arp.spa[1], arp.spa[2], arp.spa[3]);
 
-                let mut map = map_clone.lock().unwrap();
-                map.insert(mac.clone(), ip.to_string());
+                let target_mac = format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    arp.sha[0], arp.sha[1], arp.sha[2], arp.sha[3], arp.sha[4], arp.sha[5]
+                );
+                let target_ip = Ipv4Addr::new(arp.spa[0], arp.spa[1], arp.spa[2], arp.spa[3]);
+                println!(
+                    "got something: sender({}, {}), target({}, {})",
+                    sender_mac, sender_ip, target_mac, target_ip
+                );
+
+                if !sender_ip.is_unspecified() {
+                    let mut map = map_clone.lock().unwrap();
+                    map.insert(sender_mac.clone(), sender_ip.to_string());
+                }
             }
         }
+        println!("End of capture thread");
     });
 
     // Build API
@@ -97,6 +140,8 @@ async fn main() {
         .route("/ip/:mac", get(with_mac))
         .route("/search", get(search_mac))
         .route("/all", get(all_mappings))
+        .route("/", get(|| async { Redirect::permanent("/index.html") }))
+        .route("/index.html", get(handle_index))
         .with_state(ip_mac_map);
 
     println!("🚀 Server running on http://localhost:3000");
